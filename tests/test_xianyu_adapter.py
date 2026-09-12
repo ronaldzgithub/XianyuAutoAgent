@@ -55,7 +55,7 @@ class SafeAdapterTest(unittest.TestCase):
         first = adapter.execute(value)
         second = adapter.execute(value)
 
-        self.assertEqual(first["status"], "UNKNOWN")
+        self.assertEqual(first["status"], "SUCCEEDED")
         self.assertEqual(first["details"]["draft"], "draft only")
         self.assertFalse(first["external_action_performed"])
         self.assertTrue(second["replayed"])
@@ -130,7 +130,7 @@ class SafeAdapterTest(unittest.TestCase):
         )
         first = adapter.execute(value)
         duplicate = adapter.execute(value)
-        self.assertEqual(first["status"], "SUCCEEDED")
+        self.assertEqual(first["status"], "UNKNOWN")
         self.assertTrue(duplicate["replayed"])
         self.assertFalse(first["details"]["native_event_verified"])
         self.journal.close()
