@@ -31,7 +31,9 @@ Foundry 拥有服务包、线索/商机、供应能力与成本、报价边界�
 `python xianyu_adapter.py describe` 输出机器可读能力描述；`python xianyu_adapter.py execute` 从标准输入读取 `foundry.huaxiaobao.tool-request.v1` JSON，并返回 `foundry.huaxiaobao.tool-result.v1`。当前仅提供：
 
 - `account.status`：离线判断凭据是否配置；即使已配置也返回 `UNKNOWN`，不会把“存在 Cookie”冒充登录有效；
+- `inquiry.read`：接收 Huaxiaobao 从原生监听器绑定的咨询 envelope，以账号/会话/message ref 形成稳定对象并持久去重；adapter 本身不把 envelope 冒充原生事件验证；
 - `reply.draft.generate`：调用原生 `XianyuReplyBot.generate_reply`，只产生草稿；上游默认模型端点属于外部模型数据传输，调用前仍需核验客户与平台的 AI/数据条件；
+- `quote.constrain`：只对 Foundry 冻结的服务包、供应核验、验收引用、七类成本、产能/期限和 AI/转包条件做确定性边界检查；它不授予商业批准、不创建订单；
 - `reply.send`：固定返回并持久化 `PAUSED / EXTERNAL_ACTION_APPROVAL_REQUIRED`，adapter 不导入或调用 WebSocket 发送路径；
 - `operation.query`：按原 operation ID 查询持久结果，支持服务重启后的 UNKNOWN/PAUSED 恢复判断。
 

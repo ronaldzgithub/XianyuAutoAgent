@@ -21,6 +21,17 @@ REQUEST_SCHEMA = "foundry.huaxiaobao.tool-request.v1"
 RESULT_SCHEMA = "foundry.huaxiaobao.tool-result.v1"
 EXECUTOR_ID = "XianyuAutoAgent"
 SENSITIVE_KEYS = ("cookie", "token", "password", "secret", "authorization")
+SEVEN_COST_KEYS = frozenset(
+    {
+        "acquisition",
+        "model",
+        "data",
+        "human",
+        "delivery",
+        "support",
+        "risk",
+    }
+)
 
 
 def _utc_now() -> str:
@@ -64,8 +75,20 @@ def descriptor() -> Dict[str, Any]:
                 "retry_safe": True,
             },
             {
+                "id": "inquiry.read",
+                "side_effect": "none",
+                "external_action": False,
+                "retry_safe": True,
+            },
+            {
                 "id": "reply.draft.generate",
                 "side_effect": "external_model_data_egress",
+                "external_action": False,
+                "retry_safe": True,
+            },
+            {
+                "id": "quote.constrain",
+                "side_effect": "none",
                 "external_action": False,
                 "retry_safe": True,
             },
@@ -186,8 +209,12 @@ class SafeAdapter:
 
         if capability == "account.status":
             result = self._account_status(request)
+        elif capability == "inquiry.read":
+            result = self._read_inquiry(request)
         elif capability == "reply.draft.generate":
             result = self._generate_draft(request)
+        elif capability == "quote.constrain":
+            result = self._constrain_quote(request)
         elif capability == "reply.send":
             draft_ref = request.get("payload", {}).get("draft_ref")
             if not isinstance(draft_ref, str) or not draft_ref.strip():
@@ -215,6 +242,10 @@ class SafeAdapter:
             return "INVALID_REQUEST"
         if request.get("schema_version") != REQUEST_SCHEMA:
             return "UNSUPPORTED_SCHEMA_VERSION"
+        if set(request) != {
+            "schema_version", "operation_id", "capability", "account_ref", "payload"
+        }:
+            return "UNSUPPORTED_REQUEST_FIELDS"
         for field in ("operation_id", "capability", "account_ref"):
             if not isinstance(request.get(field), str) or not request[field].strip():
                 return f"MISSING_{field.upper()}"
@@ -223,6 +254,132 @@ class SafeAdapter:
         if not isinstance(request.get("payload", {}), dict):
             return "INVALID_PAYLOAD"
         return None
+
+    def _read_inquiry(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        payload = request["payload"]
+        required = {
+            "conversation_ref", "message_ref", "sender_ref", "text", "observed_at"
+        }
+        if set(payload) != required:
+            return self._result(request, "REJECTED", "INVALID_INQUIRY_FIELDS")
+        if any(
+            not isinstance(payload[field], str) or not payload[field].strip()
+            for field in required
+        ):
+            return self._result(request, "REJECTED", "INVALID_INQUIRY_FIELDS")
+        try:
+            observed = datetime.fromisoformat(payload["observed_at"].replace("Z", "+00:00"))
+        except ValueError:
+            return self._result(request, "REJECTED", "INVALID_INQUIRY_TIMESTAMP")
+        if observed.tzinfo is None:
+            return self._result(request, "REJECTED", "INVALID_INQUIRY_TIMESTAMP")
+        identity = _stable_ref(
+            "message",
+            request["account_ref"],
+            payload["conversation_ref"],
+            payload["message_ref"],
+        )
+        return self._result(
+            request,
+            "UNKNOWN",
+            "INQUIRY_OBSERVED_AWAITING_NATIVE_BINDING",
+            details={
+                "message_object_ref": identity,
+                "conversation_object_ref": _stable_ref(
+                    "conversation", request["account_ref"], payload["conversation_ref"]
+                ),
+                "sender_object_ref": _stable_ref(
+                    "sender", request["account_ref"], payload["sender_ref"]
+                ),
+                "text": payload["text"],
+                "source_observed_at": payload["observed_at"],
+                "native_event_verified": False,
+                "verification_required": "Huaxiaobao must bind this envelope to the native listener event",
+            },
+        )
+
+    def _constrain_quote(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        payload = request["payload"]
+        required = {
+            "service_package_ref",
+            "service_package_sha256",
+            "supply_verification_ref",
+            "supply_verification_sha256",
+            "acceptance_ref",
+            "currency",
+            "proposed_quote_minor",
+            "maximum_quote_minor",
+            "minimum_margin_minor",
+            "seven_costs_minor",
+            "capacity_verified",
+            "deadline_verified",
+            "ai_use_allowed",
+            "subcontracting_allowed",
+        }
+        if set(payload) != required:
+            return self._result(request, "REJECTED", "INVALID_QUOTE_CONSTRAINT_FIELDS")
+        for field in (
+            "service_package_ref", "supply_verification_ref", "acceptance_ref", "currency"
+        ):
+            if not isinstance(payload[field], str) or not payload[field].strip():
+                return self._result(request, "REJECTED", "INVALID_QUOTE_CONSTRAINT_FIELDS")
+        for field in ("service_package_sha256", "supply_verification_sha256"):
+            value = payload[field]
+            if (
+                not isinstance(value, str)
+                or len(value.removeprefix("sha256:")) != 64
+                or any(character not in "0123456789abcdef" for character in value.removeprefix("sha256:"))
+            ):
+                return self._result(request, "REJECTED", "INVALID_QUOTE_CONSTRAINT_HASH")
+        costs = payload["seven_costs_minor"]
+        if not isinstance(costs, dict) or set(costs) != SEVEN_COST_KEYS:
+            return self._result(request, "REJECTED", "INVALID_SEVEN_COSTS")
+        money_fields = {
+            "proposed_quote_minor": payload["proposed_quote_minor"],
+            "maximum_quote_minor": payload["maximum_quote_minor"],
+            "minimum_margin_minor": payload["minimum_margin_minor"],
+            **costs,
+        }
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in money_fields.values()):
+            return self._result(request, "REJECTED", "INVALID_MONEY_BOUND")
+        conditions = {
+            field: payload[field]
+            for field in (
+                "capacity_verified", "deadline_verified", "ai_use_allowed",
+                "subcontracting_allowed",
+            )
+        }
+        if any(value is not True for value in conditions.values()):
+            missing = sorted(field for field, value in conditions.items() if value is not True)
+            return self._result(
+                request,
+                "BLOCKED",
+                "SUPPLY_OR_TERMS_NOT_VERIFIED",
+                details={"missing_or_denied": missing, "quote_allowed": False},
+            )
+        minimum_quote = sum(costs.values()) + payload["minimum_margin_minor"]
+        proposed = payload["proposed_quote_minor"]
+        maximum = payload["maximum_quote_minor"]
+        allowed = minimum_quote <= proposed <= maximum
+        return self._result(
+            request,
+            "SUCCEEDED" if allowed else "BLOCKED",
+            "QUOTE_WITHIN_BOUNDS" if allowed else "QUOTE_OUTSIDE_BOUNDS",
+            details={
+                "quote_allowed": allowed,
+                "currency": payload["currency"],
+                "minimum_quote_minor": minimum_quote,
+                "maximum_quote_minor": maximum,
+                "proposed_quote_minor": proposed,
+                "service_package_ref": payload["service_package_ref"],
+                "service_package_sha256": payload["service_package_sha256"],
+                "supply_verification_ref": payload["supply_verification_ref"],
+                "supply_verification_sha256": payload["supply_verification_sha256"],
+                "acceptance_ref": payload["acceptance_ref"],
+                "commercial_approval_granted": False,
+                "external_action_performed": False,
+            },
+        )
 
     def _account_status(self, request: Dict[str, Any]) -> Dict[str, Any]:
         configured = bool(os.getenv("COOKIES_STR", "").strip())

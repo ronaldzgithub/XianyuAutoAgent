@@ -55,7 +55,7 @@ class SafeAdapterTest(unittest.TestCase):
         first = adapter.execute(value)
         second = adapter.execute(value)
 
-        self.assertEqual(first["status"], "SUCCEEDED")
+        self.assertEqual(first["status"], "UNKNOWN")
         self.assertEqual(first["details"]["draft"], "draft only")
         self.assertFalse(first["external_action_performed"])
         self.assertTrue(second["replayed"])
@@ -114,6 +114,73 @@ class SafeAdapterTest(unittest.TestCase):
         value["payload"]["cookie"] = "must-not-accept"
         result = SafeAdapter(self.journal).execute(value)
         self.assertEqual(result["code"], "CREDENTIAL_MATERIAL_FORBIDDEN")
+
+    def test_inquiry_envelope_is_stable_deduplicated_and_restart_queryable(self):
+        adapter = SafeAdapter(self.journal)
+        value = request(
+            "inquiry-1",
+            "inquiry.read",
+            {
+                "conversation_ref": "conversation-native-7",
+                "message_ref": "message-native-9",
+                "sender_ref": "sender-native-3",
+                "text": "Can this be delivered tomorrow?",
+                "observed_at": "2026-09-12T12:00:00Z",
+            },
+        )
+        first = adapter.execute(value)
+        duplicate = adapter.execute(value)
+        self.assertEqual(first["status"], "SUCCEEDED")
+        self.assertTrue(duplicate["replayed"])
+        self.assertFalse(first["details"]["native_event_verified"])
+        self.journal.close()
+        reopened = OperationJournal(self.database)
+        try:
+            queried = SafeAdapter(reopened).execute(
+                request("query-inquiry-1", "operation.query", {"target_operation_id": "inquiry-1"})
+            )
+        finally:
+            reopened.close()
+        self.journal = OperationJournal(self.database)
+        self.assertEqual(queried["details"]["target_status"], "UNKNOWN")
+
+    def test_quote_constraint_requires_seven_costs_supply_and_terms(self):
+        payload = {
+            "service_package_ref": "service-package-1",
+            "service_package_sha256": "a" * 64,
+            "supply_verification_ref": "supply-check-1",
+            "supply_verification_sha256": "b" * 64,
+            "acceptance_ref": "acceptance-contract-1",
+            "currency": "CNY",
+            "proposed_quote_minor": 15000,
+            "maximum_quote_minor": 20000,
+            "minimum_margin_minor": 3000,
+            "seven_costs_minor": {
+                "acquisition": 1000,
+                "model": 1000,
+                "data": 1000,
+                "human": 4000,
+                "delivery": 1000,
+                "support": 1000,
+                "risk": 1000,
+            },
+            "capacity_verified": True,
+            "deadline_verified": True,
+            "ai_use_allowed": True,
+            "subcontracting_allowed": True,
+        }
+        allowed = SafeAdapter(self.journal).execute(request("quote-1", "quote.constrain", payload))
+        self.assertEqual(allowed["status"], "SUCCEEDED")
+        self.assertTrue(allowed["details"]["quote_allowed"])
+        self.assertFalse(allowed["details"]["commercial_approval_granted"])
+
+        blocked_payload = dict(payload)
+        blocked_payload["ai_use_allowed"] = None
+        blocked = SafeAdapter(self.journal).execute(
+            request("quote-2", "quote.constrain", blocked_payload)
+        )
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertIn("ai_use_allowed", blocked["details"]["missing_or_denied"])
 
 
 if __name__ == "__main__":
