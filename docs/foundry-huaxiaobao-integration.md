@@ -26,6 +26,17 @@ Foundry 拥有服务包、线索/商机、供应能力与成本、报价边界�
 
 本 Fork 新增 `ENABLE_AI_AUTO_SEND` 安全开关。默认、空值及未知值均关闭 AI 直发；仅 `true`、`1`、`yes` 或 `on` 显式开启。该开关只是兼容旧版直发行为，不是 Foundry 批准，生产环境仍应通过 Huaxiaobao 的独立发送能力。
 
+## 安全 adapter surface
+
+`python xianyu_adapter.py describe` 输出机器可读能力描述；`python xianyu_adapter.py execute` 从标准输入读取 `foundry.huaxiaobao.tool-request.v1` JSON，并返回 `foundry.huaxiaobao.tool-result.v1`。当前仅提供：
+
+- `account.status`：离线判断凭据是否配置；即使已配置也返回 `UNKNOWN`，不会把“存在 Cookie”冒充登录有效；
+- `reply.draft.generate`：调用原生 `XianyuReplyBot.generate_reply`，只产生草稿；上游默认模型端点属于外部模型数据传输，调用前仍需核验客户与平台的 AI/数据条件；
+- `reply.send`：固定返回并持久化 `PAUSED / EXTERNAL_ACTION_APPROVAL_REQUIRED`，adapter 不导入或调用 WebSocket 发送路径；
+- `operation.query`：按原 operation ID 查询持久结果，支持服务重启后的 UNKNOWN/PAUSED 恢复判断。
+
+默认 SQLite journal 是 `data/huaxiaobao_adapter.db`，可用 `XIANYU_ADAPTER_STATE_PATH` 指向 Huaxiaobao 管理的持久卷。同一 operation ID 与同一内容重放返回缓存结果；同 ID 不同内容 fail closed。请求内禁止携带 Cookie、Token、密码等凭据材料。该 journal 是工具执行状态，不是商业账本或人工验收记录。
+
 ## 账号与人工入口
 
 Cookie 缺失、过期、滑块或风控应生成持久化账号所有者/工具管理员待办：
@@ -58,8 +69,8 @@ VolvenceDeploy 负责获批服务的固定版本部署、SQLite 持久化、健�
 
 - 源码基线和安全默认：已记录并有离线单元测试。
 - 本地服务/容器：未运行。
-- Foundry—Huaxiaobao 能力/回执合同：待外层 adapter 完成。
+- Foundry—Huaxiaobao 能力/回执合同：已增加草稿、账号离线状态、持久暂停与 operation 查询的最小 adapter；独立获批发送仍未实现。
 - 真实账号、平台准入和获批发送：未验证。
-- 持久化人工任务、工具复查、业务 ACK、重启及重复结果恢复：无真实证据。
+- 持久化人工任务、工具复查和业务 ACK：无真实证据；adapter 的重启查询、重复结果与幂等冲突仅有离线单元测试证据。
 
 不得把单元测试、SQLite 历史或 WebSocket 连通性声称为真实咨询、订单、客户验收或收入。
