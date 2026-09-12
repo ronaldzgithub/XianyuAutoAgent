@@ -16,6 +16,14 @@ from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager
 
 
+TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def env_flag_enabled(name):
+    """Only explicit affirmative values enable a safety-sensitive feature."""
+    return os.getenv(name, "").strip().lower() in TRUE_ENV_VALUES
+
+
 class XianyuLive:
     def __init__(self, cookies_str):
         self.xianyu = XianyuApis()
@@ -56,6 +64,10 @@ class XianyuLive:
         
         # 模拟人工输入配置
         self.simulate_human_typing = os.getenv("SIMULATE_HUMAN_TYPING", "False").lower() == "true"
+
+        # 安全默认：AI 生成的内容只作为草稿，除非部署方显式允许直接发送。
+        # Foundry/Huaxiaobao 集成仍须在外层执行具名审批和权限检查；该开关不等于审批。
+        self.ai_auto_send_enabled = env_flag_enabled("ENABLE_AI_AUTO_SEND")
 
     async def refresh_token(self):
         """刷新token"""
@@ -110,6 +122,13 @@ class XianyuLive:
                 await asyncio.sleep(60)
 
     async def send_msg(self, ws, cid, toid, text):
+        if not self.ai_auto_send_enabled:
+            logger.warning(
+                "AI自动发送默认关闭，回复仅作为未发送草稿；"
+                "如确需旧版直发行为，请显式设置 ENABLE_AI_AUTO_SEND=true"
+            )
+            return False
+
         text = {
             "contentType": 1,
             "text": {
@@ -154,6 +173,7 @@ class XianyuLive:
             ]
         }
         await ws.send(json.dumps(msg))
+        return True
 
     async def init(self, ws):
         # 如果没有token或者token过期，获取新token
@@ -528,11 +548,13 @@ class XianyuLive:
                 bargain_count = self.context_manager.get_bargain_count_by_chat(chat_id)
                 logger.info(f"用户 {send_user_name} 对商品 {item_id} 的议价次数: {bargain_count}")
             
-            # 添加机器人回复到上下文
-            self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", bot_reply)
-            
-            logger.info(f"机器人回复: {bot_reply}")
-            
+            if not self.ai_auto_send_enabled:
+                logger.warning(
+                    f"AI回复草稿未发送（会话: {chat_id}, 商品: {item_id}）；"
+                    "等待获准的人工或适配器发送流程"
+                )
+                return
+
             # 模拟人工输入延迟
             if self.simulate_human_typing:
                 # 基础延迟 0-1秒 + 每字 0.1-0.3秒
@@ -545,7 +567,11 @@ class XianyuLive:
                 logger.info(f"模拟人工输入，延迟发送 {total_delay:.2f} 秒...")
                 await asyncio.sleep(total_delay)
                 
-            await self.send_msg(websocket, chat_id, send_user_id, bot_reply)
+            sent = await self.send_msg(websocket, chat_id, send_user_id, bot_reply)
+            if sent:
+                # 只有在发送调用成功后才把 AI 回复记为助手消息；该记录仍不是平台送达 ACK。
+                self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", bot_reply)
+                logger.info(f"机器人回复已发送: {bot_reply}")
             
         except Exception as e:
             logger.error(f"处理消息时发生错误: {str(e)}")
