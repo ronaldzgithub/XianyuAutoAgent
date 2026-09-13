@@ -4,7 +4,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from xianyu_adapter import OperationJournal, SafeAdapter, descriptor
+from xianyu_adapter import (
+    NativeInquiryIdentityConflict,
+    OperationJournal,
+    SafeAdapter,
+    descriptor,
+)
 
 
 def request(operation_id, capability, payload=None):
@@ -14,6 +19,18 @@ def request(operation_id, capability, payload=None):
         "capability": capability,
         "account_ref": "owner-account-1",
         "payload": payload or {},
+    }
+
+
+def inquiry_payload(text="Can this be delivered tomorrow?", revision="revision-4"):
+    return {
+        "conversation_ref": "conversation-native-7",
+        "message_ref": "message-native-9",
+        "message_revision": revision,
+        "sender_ref": "sender-native-3",
+        "item_ref": "item-native-5",
+        "text": text,
+        "observed_at": "2026-09-12T12:00:00Z",
     }
 
 
@@ -115,34 +132,99 @@ class SafeAdapterTest(unittest.TestCase):
         result = SafeAdapter(self.journal).execute(value)
         self.assertEqual(result["code"], "CREDENTIAL_MATERIAL_FORBIDDEN")
 
-    def test_inquiry_envelope_is_stable_deduplicated_and_restart_queryable(self):
+    def test_inquiry_requires_exact_native_event_and_is_restart_queryable(self):
         adapter = SafeAdapter(self.journal)
-        value = request(
-            "inquiry-1",
-            "inquiry.read",
-            {
-                "conversation_ref": "conversation-native-7",
-                "message_ref": "message-native-9",
-                "sender_ref": "sender-native-3",
-                "text": "Can this be delivered tomorrow?",
-                "observed_at": "2026-09-12T12:00:00Z",
-            },
+        payload = inquiry_payload()
+        missing = adapter.execute(request("inquiry-missing", "inquiry.read", payload))
+        self.assertEqual(missing["status"], "UNKNOWN")
+        self.assertFalse(missing["details"]["native_event_verified"])
+
+        native = self.journal.record_native_inquiry(
+            account_ref="owner-account-1",
+            **payload,
         )
+        value = request("inquiry-verified", "inquiry.read", payload)
         first = adapter.execute(value)
         duplicate = adapter.execute(value)
-        self.assertEqual(first["status"], "UNKNOWN")
+        self.assertEqual(first["status"], "SUCCEEDED")
         self.assertTrue(duplicate["replayed"])
-        self.assertFalse(first["details"]["native_event_verified"])
+        self.assertTrue(first["details"]["native_event_verified"])
+        self.assertEqual(first["details"]["native_event_ref"], native["event_identity"])
+        self.assertEqual(first["details"]["message_revision"], "revision-4")
         self.journal.close()
         reopened = OperationJournal(self.database)
         try:
             queried = SafeAdapter(reopened).execute(
-                request("query-inquiry-1", "operation.query", {"target_operation_id": "inquiry-1"})
+                request(
+                    "query-inquiry-1",
+                    "operation.query",
+                    {"target_operation_id": "inquiry-verified"},
+                )
             )
         finally:
             reopened.close()
         self.journal = OperationJournal(self.database)
-        self.assertEqual(queried["details"]["target_status"], "UNKNOWN")
+        self.assertEqual(queried["details"]["target_status"], "SUCCEEDED")
+
+    def test_native_inquiry_duplicate_is_idempotent_and_content_conflict_fails_closed(self):
+        payload = inquiry_payload()
+        first = self.journal.record_native_inquiry(
+            account_ref="owner-account-1", **payload
+        )
+        duplicate = self.journal.record_native_inquiry(
+            account_ref="owner-account-1", **payload
+        )
+
+        self.assertFalse(first["replayed"])
+        self.assertTrue(duplicate["replayed"])
+        self.assertEqual(first["event_hash"], duplicate["event_hash"])
+        with self.assertRaises(NativeInquiryIdentityConflict):
+            self.journal.record_native_inquiry(
+                account_ref="owner-account-1",
+                **inquiry_payload(text="tampered content"),
+            )
+
+        conflict = SafeAdapter(self.journal).execute(
+            request(
+                "inquiry-conflict",
+                "inquiry.read",
+                inquiry_payload(text="tampered content"),
+            )
+        )
+        self.assertEqual(conflict["status"], "REJECTED")
+        self.assertEqual(conflict["code"], "NATIVE_EVENT_IDENTITY_CONFLICT")
+        self.assertFalse(conflict["retry_safe"])
+
+    def test_manual_pause_persists_and_only_changes_on_explicit_transition(self):
+        account_ref = "owner-account-1"
+        conversation_ref = "conversation-native-7"
+        entered = self.journal.set_conversation_paused(
+            account_ref, conversation_ref, True
+        )
+        replayed = self.journal.set_conversation_paused(
+            account_ref, conversation_ref, True
+        )
+        self.assertEqual(entered["state_revision"], 1)
+        self.assertTrue(replayed["replayed"])
+        self.assertEqual(replayed["state_revision"], 1)
+
+        self.journal.close()
+        reopened = OperationJournal(self.database)
+        try:
+            persisted = reopened.conversation_pause_state(
+                account_ref, conversation_ref
+            )
+            resumed = reopened.set_conversation_paused(
+                account_ref, conversation_ref, False
+            )
+        finally:
+            reopened.close()
+        self.journal = OperationJournal(self.database)
+
+        self.assertTrue(persisted["paused"])
+        self.assertEqual(persisted["state_revision"], 1)
+        self.assertFalse(resumed["paused"])
+        self.assertEqual(resumed["state_revision"], 2)
 
     def test_quote_constraint_requires_seven_costs_supply_and_terms(self):
         payload = {

@@ -31,13 +31,15 @@ Foundry 拥有服务包、线索/商机、供应能力与成本、报价边界�
 `python xianyu_adapter.py describe` 输出机器可读能力描述；`python xianyu_adapter.py execute` 从标准输入读取 `foundry.huaxiaobao.tool-request.v1` JSON，并返回 `foundry.huaxiaobao.tool-result.v1`。当前仅提供：
 
 - `account.status`：离线判断凭据是否配置；即使已配置也返回 `UNKNOWN`，不会把“存在 Cookie”冒充登录有效；
-- `inquiry.read`：接收 Huaxiaobao 从原生监听器绑定的咨询 envelope，以账号/会话/message ref 形成稳定对象并持久去重；adapter 本身不把 envelope 冒充原生事件验证；
+- `inquiry.read`：只接受已由本进程原生监听器原子写入 journal 的咨询，以账号、会话、message ref 和 message revision 做精确复验；事件缺失返回 `UNKNOWN`，同 identity 不同内容 fail closed；
 - `reply.draft.generate`：调用原生 `XianyuReplyBot.generate_reply`，只产生草稿；上游默认模型端点属于外部模型数据传输，调用前仍需核验客户与平台的 AI/数据条件；
 - `quote.constrain`：只对 Foundry 冻结的服务包、供应核验、验收引用、七类成本、产能/期限和 AI/转包条件做确定性边界检查；它不授予商业批准、不创建订单；
 - `reply.send`：固定返回并持久化 `PAUSED / EXTERNAL_ACTION_APPROVAL_REQUIRED`，adapter 不导入或调用 WebSocket 发送路径；
 - `operation.query`：按原 operation ID 查询持久结果，支持服务重启后的 UNKNOWN/PAUSED 恢复判断。
 
-默认 SQLite journal 是 `data/huaxiaobao_adapter.db`，可用 `XIANYU_ADAPTER_STATE_PATH` 指向 Huaxiaobao 管理的持久卷。同一 operation ID 与同一内容重放返回缓存结果；同 ID 不同内容 fail closed。请求内禁止携带 Cookie、Token、密码等凭据材料。该 journal 是工具执行状态，不是商业账本或人工验收记录。
+默认 SQLite journal 是 `data/huaxiaobao_adapter.db`，可用 `XIANYU_ADAPTER_STATE_PATH` 指向 Huaxiaobao 管理的持久卷。原生监听器与 adapter 共用此 journal：入站咨询在模型调用前写入，同一账号/会话/message ref/revision 的重复事件直接跳过，不同内容冲突停止自动处理；人工接管状态也写入同库，只有显式操作才能恢复自动模式，进程重启不会清除暂停。同一 operation ID 与同一内容重放返回缓存结果；同 ID 不同内容 fail closed。请求内禁止携带 Cookie、Token、密码等凭据材料。该 journal 是工具执行状态，不是商业账本或人工验收记录。
+
+部署时应由 Huaxiaobao 设置 `XIANYU_ACCOUNT_REF` 为不透明账号引用。未设置时，原生进程只在工具边界内从当前原生账号 ID 生成不可逆引用；该 fallback 不能替代 Huaxiaobao 对账号和租户的正式绑定。
 
 ## 账号与人工入口
 
@@ -54,7 +56,7 @@ Cookie 缺失、过期、滑块或风控应生成持久化账号所有者/工具
 
 WebSocket `code: 200` ACK 只是协议接收确认。生产 adapter 仍需实现：
 
-- 入站消息 ID 和出站 operation ID 唯一约束；
+- 入站消息 ID/revision 已在原生 journal 唯一约束；出站 operation ID 仍须由独立发送 adapter 实现；
 - 发送前批准有效性与任务版本检查；
 - 发送后平台可复查结果，而不是只信 `websocket.send`；
 - 人工结果完成、取消、失败、超时、重复和迟到处理；
@@ -71,8 +73,8 @@ VolvenceDeploy 负责获批服务的固定版本部署、SQLite 持久化、健�
 
 - 源码基线和安全默认：已记录并有离线单元测试。
 - 本地服务/容器：未运行。
-- Foundry—Huaxiaobao 能力/回执合同：已增加草稿、账号离线状态、持久暂停与 operation 查询的最小 adapter；独立获批发送仍未实现。
+- Foundry—Huaxiaobao 能力/回执合同：已增加草稿、账号离线状态、原生咨询复验、持久暂停与 operation 查询的最小 adapter；独立获批发送仍未实现。
 - 真实账号、平台准入和获批发送：未验证。
-- 持久化人工任务、工具复查和业务 ACK：无真实证据；adapter 的重启查询、重复结果与幂等冲突仅有离线单元测试证据。
+- 持久化人工任务、工具复查和业务 ACK：无真实证据；原生咨询 journal、暂停重启、adapter 查询、重复结果与幂等冲突仅有离线单元测试证据。
 
 不得把单元测试、SQLite 历史或 WebSocket 连通性声称为真实咨询、订单、客户验收或收入。

@@ -1,20 +1,32 @@
+import asyncio
 import base64
 import json
-import asyncio
-import time
 import os
-import websockets
-from loguru import logger
-from dotenv import load_dotenv, set_key
-from XianyuApis import XianyuApis
-import sys
 import random
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
+import websockets
+from dotenv import load_dotenv, set_key
+from loguru import logger
 
-from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt
-from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager
-
+from utils.xianyu_utils import (
+    decrypt,
+    generate_device_id,
+    generate_mid,
+    generate_uuid,
+    trans_cookies,
+)
+from xianyu_adapter import (
+    NativeInquiryIdentityConflict,
+    OperationJournal,
+    opaque_native_ref,
+)
+from XianyuAgent import XianyuReplyBot
+from XianyuApis import XianyuApis
 
 TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
@@ -34,6 +46,16 @@ class XianyuLive:
         self.myid = self.cookies['unb']
         self.device_id = generate_device_id(self.myid)
         self.context_manager = ChatContextManager()
+        self.account_ref = os.getenv("XIANYU_ACCOUNT_REF", "").strip() or opaque_native_ref(
+            "account", self.myid
+        )
+        self.operation_journal = OperationJournal(
+            Path(
+                os.getenv(
+                    "XIANYU_ADAPTER_STATE_PATH", "data/huaxiaobao_adapter.db"
+                )
+            )
+        )
         
         # 心跳相关配置
         self.heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL", "15"))  # 心跳间隔，默认15秒
@@ -50,11 +72,6 @@ class XianyuLive:
         self.current_token = None
         self.token_refresh_task = None
         self.connection_restart_flag = False  # 连接重启标志
-        
-        # 人工接管相关配置
-        self.manual_mode_conversations = set()  # 存储处于人工接管模式的会话ID
-        self.manual_mode_timeout = int(os.getenv("MANUAL_MODE_TIMEOUT", "3600"))  # 人工接管超时时间，默认1小时
-        self.manual_mode_timestamps = {}  # 记录进入人工模式的时间
         
         # 消息过期时间配置
         self.message_expire_time = int(os.getenv("MESSAGE_EXPIRE_TIME", "300000"))  # 消息过期时间，默认5分钟
@@ -285,40 +302,78 @@ class XianyuLive:
         message_stripped = message.strip()
         return message_stripped in self.toggle_keywords
 
+    def _conversation_ref(self, chat_id):
+        return opaque_native_ref("conversation", self.account_ref, str(chat_id))
+
     def is_manual_mode(self, chat_id):
-        """检查特定会话是否处于人工接管模式"""
-        if chat_id not in self.manual_mode_conversations:
-            return False
-        
-        # 检查是否超时
-        current_time = time.time()
-        if chat_id in self.manual_mode_timestamps:
-            if current_time - self.manual_mode_timestamps[chat_id] > self.manual_mode_timeout:
-                # 超时，自动退出人工模式
-                self.exit_manual_mode(chat_id)
-                return False
-        
-        return True
+        """从同一权威 journal 读取人工接管状态。"""
+        state = self.operation_journal.conversation_pause_state(
+            self.account_ref, self._conversation_ref(chat_id)
+        )
+        return state["paused"]
 
     def enter_manual_mode(self, chat_id):
-        """进入人工接管模式"""
-        self.manual_mode_conversations.add(chat_id)
-        self.manual_mode_timestamps[chat_id] = time.time()
+        """持久化进入人工接管模式，重复调用不增加 revision。"""
+        return self.operation_journal.set_conversation_paused(
+            self.account_ref, self._conversation_ref(chat_id), True
+        )
 
     def exit_manual_mode(self, chat_id):
-        """退出人工接管模式"""
-        self.manual_mode_conversations.discard(chat_id)
-        if chat_id in self.manual_mode_timestamps:
-            del self.manual_mode_timestamps[chat_id]
+        """显式退出人工接管；不因进程重启或超时自动恢复。"""
+        return self.operation_journal.set_conversation_paused(
+            self.account_ref, self._conversation_ref(chat_id), False
+        )
 
     def toggle_manual_mode(self, chat_id):
-        """切换人工接管模式"""
-        if self.is_manual_mode(chat_id):
-            self.exit_manual_mode(chat_id)
-            return "auto"
-        else:
-            self.enter_manual_mode(chat_id)
-            return "manual"
+        """以单个 SQLite 写事务切换人工接管模式。"""
+        state = self.operation_journal.toggle_conversation_paused(
+            self.account_ref, self._conversation_ref(chat_id)
+        )
+        return "manual" if state["paused"] else "auto"
+
+    def record_native_inquiry(
+        self,
+        *,
+        chat_id,
+        sender_id,
+        item_id,
+        create_time_ms,
+        text,
+        native_message_id=None,
+        message_revision=None,
+    ):
+        """在生成草稿前持久化原生咨询；返回 replayed 时不得重复处理。"""
+        observed_at = datetime.fromtimestamp(
+            int(create_time_ms) / 1000, tz=timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+        message_identity = str(
+            create_time_ms if native_message_id in (None, "") else native_message_id
+        )
+        revision = str(
+            create_time_ms if message_revision in (None, "") else message_revision
+        )
+        conversation_ref = self._conversation_ref(chat_id)
+        message_ref = opaque_native_ref(
+            "message",
+            self.account_ref,
+            str(chat_id),
+            message_identity,
+        )
+        return self.operation_journal.record_native_inquiry(
+            account_ref=self.account_ref,
+            conversation_ref=conversation_ref,
+            message_ref=message_ref,
+            message_revision=revision,
+            sender_ref=opaque_native_ref(
+                "sender", self.account_ref, str(sender_id)
+            ),
+            item_ref=opaque_native_ref("item", self.account_ref, str(item_id)),
+            text=str(text),
+            observed_at=observed_at,
+        )
+
+    def close(self):
+        self.operation_journal.close()
     
     def format_price(self, price):
         """
@@ -493,20 +548,57 @@ class XianyuLive:
                 return
             
             logger.info(f"用户: {send_user_name} (ID: {send_user_id}), 商品: {item_id}, 会话: {chat_id}, 消息: {send_message}")
-            
-            
-            # 如果当前会话处于人工接管模式，不进行自动回复
-            if self.is_manual_mode(chat_id):
-                logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，跳过自动回复")
-                # 添加用户消息到上下文
-                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-                return
             # 检查是否为带中括号的系统消息
             if self.is_bracket_system_message(send_message):
                 logger.info(f"检测到系统消息：'{send_message}'，跳过自动回复")
                 return
             if self.is_system_message(message):
                 logger.debug("系统消息，跳过处理")
+                return
+
+            reminder = message["1"]["10"]
+            native_message_id = next(
+                (
+                    reminder.get(name)
+                    for name in ("messageId", "message_id", "msgId", "msg_id")
+                    if reminder.get(name) not in (None, "")
+                ),
+                None,
+            )
+            message_revision = next(
+                (
+                    reminder.get(name)
+                    for name in ("messageVersion", "message_version", "version")
+                    if reminder.get(name) not in (None, "")
+                ),
+                create_time,
+            )
+            try:
+                native_event = self.record_native_inquiry(
+                    chat_id=chat_id,
+                    sender_id=send_user_id,
+                    item_id=item_id,
+                    create_time_ms=create_time,
+                    text=send_message,
+                    native_message_id=native_message_id,
+                    message_revision=message_revision,
+                )
+            except NativeInquiryIdentityConflict as exc:
+                logger.error(
+                    f"原生咨询身份冲突，已停止自动处理: {exc.event_identity}"
+                )
+                return
+            if native_event["replayed"]:
+                logger.debug(
+                    f"原生咨询重复投递，已幂等跳过: {native_event['event_identity']}"
+                )
+                return
+
+            # 如果当前会话处于人工接管模式，不进行自动回复
+            if self.is_manual_mode(chat_id):
+                logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，跳过自动回复")
+                # 添加用户消息到上下文
+                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
                 return
             # 从数据库中获取商品信息，如果不存在则从API获取并保存
             item_info = self.context_manager.get_item_info(item_id)
@@ -801,4 +893,7 @@ if __name__ == '__main__':
     bot = XianyuReplyBot()
     xianyuLive = XianyuLive(cookies_str)
     # 常驻进程
-    asyncio.run(xianyuLive.main())
+    try:
+        asyncio.run(xianyuLive.main())
+    finally:
+        xianyuLive.close()

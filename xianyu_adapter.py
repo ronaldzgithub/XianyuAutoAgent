@@ -12,10 +12,10 @@ import json
 import os
 import sqlite3
 import sys
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional
-
+from typing import Any, Dict, Optional
 
 REQUEST_SCHEMA = "foundry.huaxiaobao.tool-request.v1"
 RESULT_SCHEMA = "foundry.huaxiaobao.tool-result.v1"
@@ -48,6 +48,12 @@ def _canonical_hash(value: Dict[str, Any]) -> str:
 def _stable_ref(kind: str, *parts: str) -> str:
     digest = hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:24]
     return f"xianyu:{kind}:{digest}"
+
+
+def opaque_native_ref(kind: str, *parts: str) -> str:
+    """Return an opaque reference for a native identifier kept inside the tool boundary."""
+
+    return _stable_ref(f"native-{kind}", *parts)
 
 
 def _contains_sensitive_key(value: Any) -> bool:
@@ -114,7 +120,9 @@ class OperationJournal:
 
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(str(path))
+        self.connection = sqlite3.connect(str(path), timeout=5)
+        self.connection.execute("PRAGMA busy_timeout = 5000")
+        self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS huaxiaobao_operations (
@@ -122,6 +130,40 @@ class OperationJournal:
                 request_hash TEXT NOT NULL,
                 result_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS xianyu_native_inquiries (
+                event_identity TEXT PRIMARY KEY,
+                event_hash TEXT NOT NULL,
+                account_ref TEXT NOT NULL,
+                conversation_ref TEXT NOT NULL,
+                message_ref TEXT NOT NULL,
+                message_revision TEXT NOT NULL,
+                event_json TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(account_ref, conversation_ref, message_ref, message_revision)
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_xianyu_native_inquiries_account_observed
+            ON xianyu_native_inquiries (account_ref, observed_at)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS xianyu_conversation_takeovers (
+                account_ref TEXT NOT NULL,
+                conversation_ref TEXT NOT NULL,
+                paused INTEGER NOT NULL CHECK(paused IN (0, 1)),
+                state_revision INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(account_ref, conversation_ref)
             )
             """
         )
@@ -150,8 +192,261 @@ class OperationJournal:
         )
         self.connection.commit()
 
+    @staticmethod
+    def _require_non_empty(value: str, name: str) -> None:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-empty string")
+
+    @staticmethod
+    def _inquiry_event(
+        *,
+        account_ref: str,
+        conversation_ref: str,
+        message_ref: str,
+        message_revision: str,
+        sender_ref: str,
+        item_ref: str,
+        text: str,
+        observed_at: str,
+    ) -> dict[str, str]:
+        event = {
+            "account_ref": account_ref,
+            "conversation_ref": conversation_ref,
+            "message_ref": message_ref,
+            "message_revision": message_revision,
+            "sender_ref": sender_ref,
+            "item_ref": item_ref,
+            "text": text,
+            "observed_at": observed_at,
+        }
+        for name, value in event.items():
+            OperationJournal._require_non_empty(value, name)
+        try:
+            timestamp = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("observed_at must be an ISO-8601 timestamp") from exc
+        if timestamp.tzinfo is None:
+            raise ValueError("observed_at must include a timezone")
+        return event
+
+    def record_native_inquiry(
+        self,
+        *,
+        account_ref: str,
+        conversation_ref: str,
+        message_ref: str,
+        message_revision: str,
+        sender_ref: str,
+        item_ref: str,
+        text: str,
+        observed_at: str,
+    ) -> dict[str, Any]:
+        event = self._inquiry_event(
+            account_ref=account_ref,
+            conversation_ref=conversation_ref,
+            message_ref=message_ref,
+            message_revision=message_revision,
+            sender_ref=sender_ref,
+            item_ref=item_ref,
+            text=text,
+            observed_at=observed_at,
+        )
+        event_identity = _stable_ref(
+            "native-inquiry",
+            account_ref,
+            conversation_ref,
+            message_ref,
+            message_revision,
+        )
+        event_hash = _canonical_hash(event)
+        serialized = json.dumps(event, ensure_ascii=False, sort_keys=True)
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.connection.execute(
+                "SELECT event_hash, event_json FROM xianyu_native_inquiries "
+                "WHERE event_identity = ?",
+                (event_identity,),
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != event_hash:
+                    raise NativeInquiryIdentityConflict(event_identity)
+                self.connection.commit()
+                return {
+                    "event_identity": event_identity,
+                    "event_hash": event_hash,
+                    "event": json.loads(existing[1]),
+                    "replayed": True,
+                }
+
+            self.connection.execute(
+                "INSERT INTO xianyu_native_inquiries "
+                "(event_identity, event_hash, account_ref, conversation_ref, "
+                "message_ref, message_revision, event_json, observed_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event_identity,
+                    event_hash,
+                    account_ref,
+                    conversation_ref,
+                    message_ref,
+                    message_revision,
+                    serialized,
+                    observed_at,
+                    _utc_now(),
+                ),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return {
+            "event_identity": event_identity,
+            "event_hash": event_hash,
+            "event": event,
+            "replayed": False,
+        }
+
+    def get_native_inquiry(
+        self,
+        *,
+        account_ref: str,
+        conversation_ref: str,
+        message_ref: str,
+        message_revision: str,
+    ) -> dict[str, Any] | None:
+        event_identity = _stable_ref(
+            "native-inquiry",
+            account_ref,
+            conversation_ref,
+            message_ref,
+            message_revision,
+        )
+        row = self.connection.execute(
+            "SELECT event_hash, event_json FROM xianyu_native_inquiries "
+            "WHERE event_identity = ?",
+            (event_identity,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "event_identity": event_identity,
+            "event_hash": row[0],
+            "event": json.loads(row[1]),
+        }
+
+    def conversation_pause_state(
+        self, account_ref: str, conversation_ref: str
+    ) -> dict[str, Any]:
+        self._require_non_empty(account_ref, "account_ref")
+        self._require_non_empty(conversation_ref, "conversation_ref")
+        row = self.connection.execute(
+            "SELECT paused, state_revision, updated_at "
+            "FROM xianyu_conversation_takeovers "
+            "WHERE account_ref = ? AND conversation_ref = ?",
+            (account_ref, conversation_ref),
+        ).fetchone()
+        if row is None:
+            return {"paused": False, "state_revision": 0, "updated_at": None}
+        return {
+            "paused": bool(row[0]),
+            "state_revision": row[1],
+            "updated_at": row[2],
+        }
+
+    def set_conversation_paused(
+        self, account_ref: str, conversation_ref: str, paused: bool
+    ) -> dict[str, Any]:
+        if not isinstance(paused, bool):
+            raise TypeError("paused must be a boolean")
+        self._require_non_empty(account_ref, "account_ref")
+        self._require_non_empty(conversation_ref, "conversation_ref")
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT paused, state_revision, updated_at "
+                "FROM xianyu_conversation_takeovers "
+                "WHERE account_ref = ? AND conversation_ref = ?",
+                (account_ref, conversation_ref),
+            ).fetchone()
+            if row is not None and bool(row[0]) is paused:
+                self.connection.commit()
+                return {
+                    "paused": paused,
+                    "state_revision": row[1],
+                    "updated_at": row[2],
+                    "replayed": True,
+                }
+            revision = 1 if row is None else row[1] + 1
+            updated_at = _utc_now()
+            self.connection.execute(
+                "INSERT INTO xianyu_conversation_takeovers "
+                "(account_ref, conversation_ref, paused, state_revision, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(account_ref, conversation_ref) DO UPDATE SET "
+                "paused = excluded.paused, "
+                "state_revision = excluded.state_revision, "
+                "updated_at = excluded.updated_at",
+                (account_ref, conversation_ref, int(paused), revision, updated_at),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return {
+            "paused": paused,
+            "state_revision": revision,
+            "updated_at": updated_at,
+            "replayed": False,
+        }
+
+    def toggle_conversation_paused(
+        self, account_ref: str, conversation_ref: str
+    ) -> dict[str, Any]:
+        self._require_non_empty(account_ref, "account_ref")
+        self._require_non_empty(conversation_ref, "conversation_ref")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT paused, state_revision FROM xianyu_conversation_takeovers "
+                "WHERE account_ref = ? AND conversation_ref = ?",
+                (account_ref, conversation_ref),
+            ).fetchone()
+            paused = True if row is None else not bool(row[0])
+            revision = 1 if row is None else row[1] + 1
+            updated_at = _utc_now()
+            self.connection.execute(
+                "INSERT INTO xianyu_conversation_takeovers "
+                "(account_ref, conversation_ref, paused, state_revision, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(account_ref, conversation_ref) DO UPDATE SET "
+                "paused = excluded.paused, "
+                "state_revision = excluded.state_revision, "
+                "updated_at = excluded.updated_at",
+                (account_ref, conversation_ref, int(paused), revision, updated_at),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return {
+            "paused": paused,
+            "state_revision": revision,
+            "updated_at": updated_at,
+            "replayed": False,
+        }
+
     def close(self) -> None:
         self.connection.close()
+
+
+class NativeInquiryIdentityConflict(RuntimeError):
+    def __init__(self, event_identity: str):
+        super().__init__(
+            f"native inquiry identity is already bound to different content: {event_identity}"
+        )
+        self.event_identity = event_identity
 
 
 class SafeAdapter:
@@ -258,7 +553,13 @@ class SafeAdapter:
     def _read_inquiry(self, request: Dict[str, Any]) -> Dict[str, Any]:
         payload = request["payload"]
         required = {
-            "conversation_ref", "message_ref", "sender_ref", "text", "observed_at"
+            "conversation_ref",
+            "message_ref",
+            "message_revision",
+            "sender_ref",
+            "item_ref",
+            "text",
+            "observed_at",
         }
         if set(payload) != required:
             return self._result(request, "REJECTED", "INVALID_INQUIRY_FIELDS")
@@ -273,16 +574,59 @@ class SafeAdapter:
             return self._result(request, "REJECTED", "INVALID_INQUIRY_TIMESTAMP")
         if observed.tzinfo is None:
             return self._result(request, "REJECTED", "INVALID_INQUIRY_TIMESTAMP")
+        native = self.journal.get_native_inquiry(
+            account_ref=request["account_ref"],
+            conversation_ref=payload["conversation_ref"],
+            message_ref=payload["message_ref"],
+            message_revision=payload["message_revision"],
+        )
         identity = _stable_ref(
             "message",
             request["account_ref"],
             payload["conversation_ref"],
             payload["message_ref"],
+            payload["message_revision"],
         )
+        if native is None:
+            return self._result(
+                request,
+                "UNKNOWN",
+                "INQUIRY_NOT_OBSERVED_BY_NATIVE_LISTENER",
+                details={
+                    "message_object_ref": identity,
+                    "conversation_object_ref": _stable_ref(
+                        "conversation", request["account_ref"], payload["conversation_ref"]
+                    ),
+                    "message_revision": payload["message_revision"],
+                    "native_event_verified": False,
+                },
+            )
+
+        expected_event = self.journal._inquiry_event(
+            account_ref=request["account_ref"],
+            conversation_ref=payload["conversation_ref"],
+            message_ref=payload["message_ref"],
+            message_revision=payload["message_revision"],
+            sender_ref=payload["sender_ref"],
+            item_ref=payload["item_ref"],
+            text=payload["text"],
+            observed_at=payload["observed_at"],
+        )
+        if native["event_hash"] != _canonical_hash(expected_event):
+            return self._result(
+                request,
+                "REJECTED",
+                "NATIVE_EVENT_IDENTITY_CONFLICT",
+                details={
+                    "message_object_ref": identity,
+                    "message_revision": payload["message_revision"],
+                },
+                retry_safe=False,
+            )
         return self._result(
             request,
-            "UNKNOWN",
-            "INQUIRY_OBSERVED_AWAITING_NATIVE_BINDING",
+            "SUCCEEDED",
+            "NATIVE_INQUIRY_VERIFIED",
             details={
                 "message_object_ref": identity,
                 "conversation_object_ref": _stable_ref(
@@ -291,10 +635,15 @@ class SafeAdapter:
                 "sender_object_ref": _stable_ref(
                     "sender", request["account_ref"], payload["sender_ref"]
                 ),
+                "item_object_ref": _stable_ref(
+                    "item", request["account_ref"], payload["item_ref"]
+                ),
+                "message_revision": payload["message_revision"],
                 "text": payload["text"],
                 "source_observed_at": payload["observed_at"],
-                "native_event_verified": False,
-                "verification_required": "Huaxiaobao must bind this envelope to the native listener event",
+                "native_event_ref": native["event_identity"],
+                "native_event_hash": native["event_hash"],
+                "native_event_verified": True,
             },
         )
 
