@@ -52,7 +52,12 @@ class AiAutoSendGateTests(unittest.TestCase):
             first = object.__new__(XianyuLive)
             first.account_ref = "account-opaque-1"
             first.operation_journal = OperationJournal(database)
-            entered = first.enter_manual_mode("native-chat-7")
+            entered = first.apply_manual_mode_command(
+                chat_id="native-chat-7",
+                native_message_id="native-control-1",
+                message_revision="1",
+                desired_paused=True,
+            )
             self.assertTrue(entered["paused"])
             self.assertTrue(first.is_manual_mode("native-chat-7"))
             first.close()
@@ -62,7 +67,21 @@ class AiAutoSendGateTests(unittest.TestCase):
             restarted.operation_journal = OperationJournal(database)
             try:
                 self.assertTrue(restarted.is_manual_mode("native-chat-7"))
-                self.assertEqual(restarted.toggle_manual_mode("native-chat-7"), "auto")
+                duplicate = restarted.apply_manual_mode_command(
+                    chat_id="native-chat-7",
+                    native_message_id="native-control-1",
+                    message_revision="1",
+                    desired_paused=True,
+                )
+                self.assertTrue(duplicate["command_replayed"])
+                self.assertTrue(restarted.is_manual_mode("native-chat-7"))
+                resumed = restarted.apply_manual_mode_command(
+                    chat_id="native-chat-7",
+                    native_message_id="native-control-2",
+                    message_revision="1",
+                    desired_paused=False,
+                )
+                self.assertFalse(resumed["paused"])
                 self.assertFalse(restarted.is_manual_mode("native-chat-7"))
             finally:
                 restarted.close()
@@ -112,7 +131,7 @@ class AiAutoSendGateTests(unittest.TestCase):
         self.assertNotIn("native-chat-7", str(first))
         self.assertNotIn("native-buyer-3", str(first))
 
-    def test_listener_skips_duplicate_native_inquiry_before_repeat_processing(self):
+    def test_listener_does_not_claim_or_duplicate_context_while_paused(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             live = object.__new__(XianyuLive)
             live.account_ref = "account-opaque-1"
@@ -121,7 +140,8 @@ class AiAutoSendGateTests(unittest.TestCase):
             )
             live.myid = "native-seller"
             live.message_expire_time = 300_000
-            live.toggle_keywords = "。"
+            live.inquiry_claimant_ref = "listener-instance-test"
+            live.inquiry_lease_seconds = 60
             live.context_manager = MagicMock()
             live.enter_manual_mode("native-chat-7")
             websocket = AsyncMock()
@@ -153,7 +173,7 @@ class AiAutoSendGateTests(unittest.TestCase):
             finally:
                 live.close()
 
-        live.context_manager.add_message_by_chat.assert_called_once()
+        live.context_manager.add_message_by_chat.assert_not_called()
 
 
 if __name__ == "__main__":

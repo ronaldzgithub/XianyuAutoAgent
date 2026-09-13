@@ -70,7 +70,8 @@ COOKIES_STR=填写网页端获取的cookie
 MODEL_BASE_URL=模型地址
 MODEL_NAME=模型名称
 #可选配置
-TOGGLE_KEYWORDS=接管模式切换关键词，默认为句号（输入句号切换为人工接管，再次输入则切换AI接管）
+MANUAL_TAKEOVER_KEYWORDS=进入人工接管的明确命令，默认为句号
+MANUAL_RESUME_KEYWORDS=恢复自动处理的明确命令，默认为“恢复自动”；重复命令保持同一目标状态，不执行 toggle
 SIMULATE_HUMAN_TYPING=True/False #模拟人工回复延迟
 ENABLE_AI_AUTO_SEND=True/False #默认 False；只有显式开启才允许 AI 生成后直接发送
 

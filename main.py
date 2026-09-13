@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import random
@@ -21,8 +22,13 @@ from utils.xianyu_utils import (
     trans_cookies,
 )
 from xianyu_adapter import (
+    NativeInquiryAckConflict,
+    NativeInquiryBindingConflict,
     NativeInquiryIdentityConflict,
+    NativeInquiryLeaseConflict,
     OperationJournal,
+    TakeoverCommandBindingConflict,
+    TakeoverCommandIdentityConflict,
     opaque_native_ref,
 )
 from XianyuAgent import XianyuReplyBot
@@ -48,6 +54,12 @@ class XianyuLive:
         self.context_manager = ChatContextManager()
         self.account_ref = os.getenv("XIANYU_ACCOUNT_REF", "").strip() or opaque_native_ref(
             "account", self.myid
+        )
+        self.inquiry_claimant_ref = opaque_native_ref(
+            "listener-instance",
+            self.account_ref,
+            str(os.getpid()),
+            str(time.time_ns()),
         )
         self.operation_journal = OperationJournal(
             Path(
@@ -76,8 +88,16 @@ class XianyuLive:
         # 消息过期时间配置
         self.message_expire_time = int(os.getenv("MESSAGE_EXPIRE_TIME", "300000"))  # 消息过期时间，默认5分钟
         
-        # 人工接管关键词，从环境变量读取
-        self.toggle_keywords = os.getenv("TOGGLE_KEYWORDS", "。")
+        # 人工接管使用 desired-state 命令，重复投递不会反向切换状态。
+        self.manual_takeover_keywords = self._keyword_set(
+            os.getenv("MANUAL_TAKEOVER_KEYWORDS", os.getenv("TOGGLE_KEYWORDS", "。"))
+        )
+        self.manual_resume_keywords = self._keyword_set(
+            os.getenv("MANUAL_RESUME_KEYWORDS", "恢复自动")
+        )
+        if self.manual_takeover_keywords & self.manual_resume_keywords:
+            raise ValueError("manual takeover and resume keywords must not overlap")
+        self.inquiry_lease_seconds = int(os.getenv("XIANYU_INQUIRY_LEASE_SECONDS", "60"))
         
         # 模拟人工输入配置
         self.simulate_human_typing = os.getenv("SIMULATE_HUMAN_TYPING", "False").lower() == "true"
@@ -297,10 +317,20 @@ class XianyuLive:
             logger.error(f"检查系统消息失败: {e}")
             return False
 
-    def check_toggle_keywords(self, message):
-        """检查消息是否包含切换关键词"""
+    @staticmethod
+    def _keyword_set(raw_value):
+        return frozenset(
+            keyword.strip() for keyword in raw_value.split(",") if keyword.strip()
+        )
+
+    def desired_manual_state(self, message):
+        """把控制消息解析为明确目标状态；不执行非幂等 toggle。"""
         message_stripped = message.strip()
-        return message_stripped in self.toggle_keywords
+        if message_stripped in self.manual_takeover_keywords:
+            return True
+        if message_stripped in self.manual_resume_keywords:
+            return False
+        return None
 
     def _conversation_ref(self, chat_id):
         return opaque_native_ref("conversation", self.account_ref, str(chat_id))
@@ -324,12 +354,25 @@ class XianyuLive:
             self.account_ref, self._conversation_ref(chat_id), False
         )
 
-    def toggle_manual_mode(self, chat_id):
-        """以单个 SQLite 写事务切换人工接管模式。"""
-        state = self.operation_journal.toggle_conversation_paused(
-            self.account_ref, self._conversation_ref(chat_id)
+    def apply_manual_mode_command(
+        self,
+        *,
+        chat_id,
+        native_message_id,
+        message_revision,
+        desired_paused,
+    ):
+        """持久化与原生消息 revision 绑定的 desired-state 控制命令。"""
+        message_ref = opaque_native_ref(
+            "control-message", self.account_ref, str(native_message_id)
         )
-        return "manual" if state["paused"] else "auto"
+        return self.operation_journal.apply_conversation_pause_command(
+            account_ref=self.account_ref,
+            conversation_ref=self._conversation_ref(chat_id),
+            message_ref=message_ref,
+            message_revision=str(message_revision),
+            desired_paused=desired_paused,
+        )
 
     def record_native_inquiry(
         self,
@@ -370,6 +413,34 @@ class XianyuLive:
             item_ref=opaque_native_ref("item", self.account_ref, str(item_id)),
             text=str(text),
             observed_at=observed_at,
+        )
+
+    def claim_native_inquiry(self, event):
+        return self.operation_journal.claim_native_inquiry(
+            account_ref=event["account_ref"],
+            conversation_ref=event["conversation_ref"],
+            message_ref=event["message_ref"],
+            message_revision=event["message_revision"],
+            claimant_ref=self.inquiry_claimant_ref,
+            lease_seconds=self.inquiry_lease_seconds,
+        )
+
+    def ack_native_inquiry(self, event, lease_ref, outcome, checkpoint_material):
+        checkpoint_sha256 = hashlib.sha256(
+            checkpoint_material.encode("utf-8")
+        ).hexdigest()
+        checkpoint_ref = opaque_native_ref(
+            "inquiry-checkpoint", event["message_ref"], outcome, checkpoint_sha256
+        )
+        return self.operation_journal.ack_native_inquiry(
+            account_ref=event["account_ref"],
+            conversation_ref=event["conversation_ref"],
+            message_ref=event["message_ref"],
+            message_revision=event["message_revision"],
+            lease_ref=lease_ref,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha256=checkpoint_sha256,
+            outcome=outcome,
         )
 
     def close(self):
@@ -529,14 +600,47 @@ class XianyuLive:
                 logger.warning("无法获取商品ID")
                 return
 
+            reminder = message["1"]["10"]
+            native_message_id = next(
+                (
+                    reminder.get(name)
+                    for name in ("messageId", "message_id", "msgId", "msg_id")
+                    if reminder.get(name) not in (None, "")
+                ),
+                create_time,
+            )
+            message_revision = next(
+                (
+                    reminder.get(name)
+                    for name in ("messageVersion", "message_version", "version")
+                    if reminder.get(name) not in (None, "")
+                ),
+                create_time,
+            )
+
             # 检查是否为卖家（自己）发送的控制命令
             if send_user_id == self.myid:
                 logger.debug("检测到卖家消息，检查是否为控制命令")
-                
-                # 检查切换命令
-                if self.check_toggle_keywords(send_message):
-                    mode = self.toggle_manual_mode(chat_id)
-                    if mode == "manual":
+
+                desired_paused = self.desired_manual_state(send_message)
+                if desired_paused is not None:
+                    try:
+                        state = self.apply_manual_mode_command(
+                            chat_id=chat_id,
+                            native_message_id=native_message_id,
+                            message_revision=message_revision,
+                            desired_paused=desired_paused,
+                        )
+                    except (
+                        TakeoverCommandBindingConflict,
+                        TakeoverCommandIdentityConflict,
+                    ) as exc:
+                        logger.error(
+                            "人工接管命令身份冲突，已保持原状态: "
+                            f"{exc.command_identity}"
+                        )
+                        return
+                    if state["paused"]:
                         logger.info(f"🔴 已接管会话 {chat_id} (商品: {item_id})")
                     else:
                         logger.info(f"🟢 已恢复会话 {chat_id} 的自动回复 (商品: {item_id})")
@@ -556,23 +660,6 @@ class XianyuLive:
                 logger.debug("系统消息，跳过处理")
                 return
 
-            reminder = message["1"]["10"]
-            native_message_id = next(
-                (
-                    reminder.get(name)
-                    for name in ("messageId", "message_id", "msgId", "msg_id")
-                    if reminder.get(name) not in (None, "")
-                ),
-                None,
-            )
-            message_revision = next(
-                (
-                    reminder.get(name)
-                    for name in ("messageVersion", "message_version", "version")
-                    if reminder.get(name) not in (None, "")
-                ),
-                create_time,
-            )
             try:
                 native_event = self.record_native_inquiry(
                     chat_id=chat_id,
@@ -583,23 +670,33 @@ class XianyuLive:
                     native_message_id=native_message_id,
                     message_revision=message_revision,
                 )
-            except NativeInquiryIdentityConflict as exc:
+            except (
+                NativeInquiryBindingConflict,
+                NativeInquiryIdentityConflict,
+            ) as exc:
                 logger.error(
                     f"原生咨询身份冲突，已停止自动处理: {exc.event_identity}"
                 )
                 return
             if native_event["replayed"]:
                 logger.debug(
-                    f"原生咨询重复投递，已幂等跳过: {native_event['event_identity']}"
+                    f"原生咨询重复投递，检查处理 checkpoint: {native_event['event_identity']}"
+                )
+            try:
+                claim = self.claim_native_inquiry(native_event["event"])
+            except NativeInquiryBindingConflict as exc:
+                logger.error(f"原生咨询绑定冲突，已停止处理: {exc.event_identity}")
+                return
+            if claim["status"] == "PAUSED":
+                logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，咨询保留待恢复")
+                return
+            if not claim["claimed"] or claim["replayed"]:
+                logger.debug(
+                    f"原生咨询已有 lease 或已处理，未重复执行: {claim['event_identity']}"
                 )
                 return
+            lease_ref = claim["lease_ref"]
 
-            # 如果当前会话处于人工接管模式，不进行自动回复
-            if self.is_manual_mode(chat_id):
-                logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，跳过自动回复")
-                # 添加用户消息到上下文
-                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-                return
             # 从数据库中获取商品信息，如果不存在则从API获取并保存
             item_info = self.context_manager.get_item_info(item_id)
             if not item_info:
@@ -628,6 +725,19 @@ class XianyuLive:
             
             # 检查是否需要回复
             if bot_reply == "-":
+                try:
+                    self.ack_native_inquiry(
+                        native_event["event"],
+                        lease_ref,
+                        "NO_REPLY_REQUIRED",
+                        "NO_REPLY_REQUIRED",
+                    )
+                except (NativeInquiryAckConflict, NativeInquiryLeaseConflict) as exc:
+                    logger.error(
+                        "咨询处理 ACK 已过期或被撤销: "
+                        f"{exc.event_identity}"
+                    )
+                    return
                 logger.info(f"[无需回复] 用户 {send_user_name} 的消息被识别为无需回复类型")
                 return
             
@@ -639,12 +749,29 @@ class XianyuLive:
                 self.context_manager.increment_bargain_count_by_chat(chat_id)
                 bargain_count = self.context_manager.get_bargain_count_by_chat(chat_id)
                 logger.info(f"用户 {send_user_name} 对商品 {item_id} 的议价次数: {bargain_count}")
-            
+
+            try:
+                self.ack_native_inquiry(
+                    native_event["event"],
+                    lease_ref,
+                    "DRAFT_GENERATED_NOT_DELIVERED",
+                    bot_reply,
+                )
+            except (NativeInquiryAckConflict, NativeInquiryLeaseConflict) as exc:
+                logger.error(
+                    f"咨询处理 ACK 已过期或被撤销，禁止后续动作: {exc.event_identity}"
+                )
+                return
+
             if not self.ai_auto_send_enabled:
                 logger.warning(
                     f"AI回复草稿未发送（会话: {chat_id}, 商品: {item_id}）；"
                     "等待获准的人工或适配器发送流程"
                 )
+                return
+
+            if self.is_manual_mode(chat_id):
+                logger.warning(f"会话 {chat_id} 已被人工接管，禁止旧版直发")
                 return
 
             # 模拟人工输入延迟

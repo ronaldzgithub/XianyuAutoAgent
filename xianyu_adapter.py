@@ -12,8 +12,9 @@ import json
 import os
 import sqlite3
 import sys
+import uuid
 from collections.abc import Callable, Iterable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -32,10 +33,18 @@ SEVEN_COST_KEYS = frozenset(
         "risk",
     }
 )
-
-
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc(value: str, name: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{name} must include a timezone")
+    return parsed.astimezone(timezone.utc)
 
 
 def _canonical_hash(value: Dict[str, Any]) -> str:
@@ -122,6 +131,7 @@ class OperationJournal:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(str(path), timeout=5)
         self.connection.execute("PRAGMA busy_timeout = 5000")
+        self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute(
             """
@@ -166,6 +176,58 @@ class OperationJournal:
                 PRIMARY KEY(account_ref, conversation_ref)
             )
             """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS xianyu_inquiry_processing (
+                event_identity TEXT PRIMARY KEY,
+                account_ref TEXT NOT NULL,
+                conversation_ref TEXT NOT NULL,
+                message_ref TEXT NOT NULL,
+                message_revision TEXT NOT NULL,
+                status TEXT NOT NULL
+                    CHECK(status IN ('OBSERVED', 'PROCESSING', 'PROCESSED')),
+                processing_revision INTEGER NOT NULL DEFAULT 0,
+                claimant_ref TEXT,
+                lease_ref TEXT,
+                lease_expires_at TEXT,
+                ack_hash TEXT,
+                ack_json TEXT,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(event_identity)
+                    REFERENCES xianyu_native_inquiries(event_identity),
+                UNIQUE(account_ref, conversation_ref, message_ref, message_revision)
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS xianyu_takeover_commands (
+                command_identity TEXT PRIMARY KEY,
+                command_hash TEXT NOT NULL,
+                account_ref TEXT NOT NULL,
+                conversation_ref TEXT NOT NULL,
+                message_ref TEXT NOT NULL,
+                message_revision TEXT NOT NULL,
+                desired_paused INTEGER NOT NULL CHECK(desired_paused IN (0, 1)),
+                command_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(account_ref, message_ref, message_revision)
+            )
+            """
+        )
+        now = _utc_now()
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO xianyu_inquiry_processing (
+                event_identity, account_ref, conversation_ref, message_ref,
+                message_revision, status, processing_revision, updated_at
+            )
+            SELECT event_identity, account_ref, conversation_ref, message_ref,
+                   message_revision, 'OBSERVED', 0, ?
+            FROM xianyu_native_inquiries
+            """,
+            (now,),
         )
         self.connection.commit()
 
@@ -271,6 +333,20 @@ class OperationJournal:
             if existing is not None:
                 if existing[0] != event_hash:
                     raise NativeInquiryIdentityConflict(event_identity)
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO xianyu_inquiry_processing "
+                    "(event_identity, account_ref, conversation_ref, message_ref, "
+                    "message_revision, status, processing_revision, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'OBSERVED', 0, ?)",
+                    (
+                        event_identity,
+                        account_ref,
+                        conversation_ref,
+                        message_ref,
+                        message_revision,
+                        _utc_now(),
+                    ),
+                )
                 self.connection.commit()
                 return {
                     "event_identity": event_identity,
@@ -278,6 +354,14 @@ class OperationJournal:
                     "event": json.loads(existing[1]),
                     "replayed": True,
                 }
+
+            conflicting = self.connection.execute(
+                "SELECT event_identity FROM xianyu_native_inquiries "
+                "WHERE message_ref = ? LIMIT 1",
+                (message_ref,),
+            ).fetchone()
+            if conflicting is not None:
+                raise NativeInquiryBindingConflict(conflicting[0])
 
             self.connection.execute(
                 "INSERT INTO xianyu_native_inquiries "
@@ -293,6 +377,20 @@ class OperationJournal:
                     message_revision,
                     serialized,
                     observed_at,
+                    _utc_now(),
+                ),
+            )
+            self.connection.execute(
+                "INSERT INTO xianyu_inquiry_processing "
+                "(event_identity, account_ref, conversation_ref, message_ref, "
+                "message_revision, status, processing_revision, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'OBSERVED', 0, ?)",
+                (
+                    event_identity,
+                    account_ref,
+                    conversation_ref,
+                    message_ref,
+                    message_revision,
                     _utc_now(),
                 ),
             )
@@ -328,11 +426,310 @@ class OperationJournal:
             (event_identity,),
         ).fetchone()
         if row is None:
+            conflicting = self.connection.execute(
+                "SELECT event_identity FROM xianyu_native_inquiries "
+                "WHERE message_ref = ? LIMIT 1",
+                (message_ref,),
+            ).fetchone()
+            if conflicting is not None:
+                raise NativeInquiryBindingConflict(conflicting[0])
             return None
         return {
             "event_identity": event_identity,
             "event_hash": row[0],
             "event": json.loads(row[1]),
+        }
+
+    def _bound_native_inquiry(
+        self,
+        *,
+        account_ref: str,
+        conversation_ref: str,
+        message_ref: str,
+        message_revision: str,
+    ) -> tuple[str, str, dict[str, Any]]:
+        for name, value in {
+            "account_ref": account_ref,
+            "conversation_ref": conversation_ref,
+            "message_ref": message_ref,
+            "message_revision": message_revision,
+        }.items():
+            self._require_non_empty(value, name)
+        event_identity = _stable_ref(
+            "native-inquiry",
+            account_ref,
+            conversation_ref,
+            message_ref,
+            message_revision,
+        )
+        row = self.connection.execute(
+            "SELECT event_identity, event_hash, event_json "
+            "FROM xianyu_native_inquiries WHERE event_identity = ?",
+            (event_identity,),
+        ).fetchone()
+        if row is not None:
+            return row[0], row[1], json.loads(row[2])
+        conflicting = self.connection.execute(
+            "SELECT event_identity FROM xianyu_native_inquiries "
+            "WHERE message_ref = ? LIMIT 1",
+            (message_ref,),
+        ).fetchone()
+        if conflicting is not None:
+            raise NativeInquiryBindingConflict(conflicting[0])
+        raise NativeInquiryNotFound(event_identity)
+
+    def inquiry_processing_state(
+        self,
+        *,
+        account_ref: str,
+        conversation_ref: str,
+        message_ref: str,
+        message_revision: str,
+    ) -> dict[str, Any]:
+        event_identity, _, _ = self._bound_native_inquiry(
+            account_ref=account_ref,
+            conversation_ref=conversation_ref,
+            message_ref=message_ref,
+            message_revision=message_revision,
+        )
+        row = self.connection.execute(
+            "SELECT status, processing_revision, claimant_ref, lease_ref, "
+            "lease_expires_at, ack_hash, ack_json, updated_at "
+            "FROM xianyu_inquiry_processing WHERE event_identity = ?",
+            (event_identity,),
+        ).fetchone()
+        if row is None:
+            raise NativeInquiryNotFound(event_identity)
+        return {
+            "event_identity": event_identity,
+            "status": row[0],
+            "processing_revision": row[1],
+            "claimant_ref": row[2],
+            "lease_ref": row[3],
+            "lease_expires_at": row[4],
+            "ack_hash": row[5],
+            "ack": json.loads(row[6]) if row[6] else None,
+            "updated_at": row[7],
+        }
+
+    def claim_native_inquiry(
+        self,
+        *,
+        account_ref: str,
+        conversation_ref: str,
+        message_ref: str,
+        message_revision: str,
+        claimant_ref: str,
+        lease_seconds: int = 60,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_non_empty(claimant_ref, "claimant_ref")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int):
+            raise TypeError("lease_seconds must be an integer")
+        if not 1 <= lease_seconds <= 3600:
+            raise ValueError("lease_seconds must be between 1 and 3600")
+        claimed_at = _parse_utc(now or _utc_now(), "now")
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            event_identity, event_hash, event = self._bound_native_inquiry(
+                account_ref=account_ref,
+                conversation_ref=conversation_ref,
+                message_ref=message_ref,
+                message_revision=message_revision,
+            )
+            paused = self.connection.execute(
+                "SELECT paused FROM xianyu_conversation_takeovers "
+                "WHERE account_ref = ? AND conversation_ref = ?",
+                (account_ref, conversation_ref),
+            ).fetchone()
+            if paused is not None and bool(paused[0]):
+                self.connection.commit()
+                return {
+                    "event_identity": event_identity,
+                    "event_hash": event_hash,
+                    "status": "PAUSED",
+                    "claimed": False,
+                    "replayed": False,
+                }
+
+            row = self.connection.execute(
+                "SELECT status, processing_revision, claimant_ref, lease_ref, "
+                "lease_expires_at, ack_hash, ack_json "
+                "FROM xianyu_inquiry_processing WHERE event_identity = ?",
+                (event_identity,),
+            ).fetchone()
+            if row is None:
+                raise NativeInquiryNotFound(event_identity)
+            status, revision, current_claimant, lease_ref, expires_at, ack_hash, ack_json = row
+            if status == "PROCESSED":
+                self.connection.commit()
+                return {
+                    "event_identity": event_identity,
+                    "event_hash": event_hash,
+                    "status": status,
+                    "claimed": False,
+                    "replayed": True,
+                    "processing_revision": revision,
+                    "ack_hash": ack_hash,
+                    "ack": json.loads(ack_json) if ack_json else None,
+                }
+            if status == "PROCESSING" and expires_at:
+                expiry = _parse_utc(expires_at, "lease_expires_at")
+                if expiry > claimed_at:
+                    same_claimant = current_claimant == claimant_ref
+                    self.connection.commit()
+                    return {
+                        "event_identity": event_identity,
+                        "event_hash": event_hash,
+                        "status": status,
+                        "claimed": same_claimant,
+                        "replayed": same_claimant,
+                        "busy": not same_claimant,
+                        "processing_revision": revision,
+                        "claimant_ref": current_claimant,
+                        "lease_ref": lease_ref if same_claimant else None,
+                        "lease_expires_at": expires_at,
+                        "event": event if same_claimant else None,
+                    }
+
+            revision += 1
+            expires = claimed_at + timedelta(seconds=lease_seconds)
+            expires_text = expires.isoformat().replace("+00:00", "Z")
+            lease_ref = _stable_ref(
+                "inquiry-lease",
+                event_identity,
+                str(revision),
+                uuid.uuid4().hex,
+            )
+            updated_at = claimed_at.isoformat().replace("+00:00", "Z")
+            self.connection.execute(
+                "UPDATE xianyu_inquiry_processing SET status = 'PROCESSING', "
+                "processing_revision = ?, claimant_ref = ?, lease_ref = ?, "
+                "lease_expires_at = ?, ack_hash = NULL, ack_json = NULL, updated_at = ? "
+                "WHERE event_identity = ?",
+                (
+                    revision,
+                    claimant_ref,
+                    lease_ref,
+                    expires_text,
+                    updated_at,
+                    event_identity,
+                ),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return {
+            "event_identity": event_identity,
+            "event_hash": event_hash,
+            "status": "PROCESSING",
+            "claimed": True,
+            "replayed": False,
+            "busy": False,
+            "processing_revision": revision,
+            "claimant_ref": claimant_ref,
+            "lease_ref": lease_ref,
+            "lease_expires_at": expires_text,
+            "event": event,
+        }
+
+    def ack_native_inquiry(
+        self,
+        *,
+        account_ref: str,
+        conversation_ref: str,
+        message_ref: str,
+        message_revision: str,
+        lease_ref: str,
+        checkpoint_ref: str,
+        checkpoint_sha256: str,
+        outcome: str,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        for name, value in {
+            "lease_ref": lease_ref,
+            "checkpoint_ref": checkpoint_ref,
+            "checkpoint_sha256": checkpoint_sha256,
+            "outcome": outcome,
+        }.items():
+            self._require_non_empty(value, name)
+        digest = checkpoint_sha256.removeprefix("sha256:")
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("checkpoint_sha256 must be a lowercase SHA-256 digest")
+        acknowledged_at = _parse_utc(now or _utc_now(), "now")
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            event_identity, event_hash, _ = self._bound_native_inquiry(
+                account_ref=account_ref,
+                conversation_ref=conversation_ref,
+                message_ref=message_ref,
+                message_revision=message_revision,
+            )
+            ack = {
+                "event_identity": event_identity,
+                "event_hash": event_hash,
+                "account_ref": account_ref,
+                "conversation_ref": conversation_ref,
+                "message_ref": message_ref,
+                "message_revision": message_revision,
+                "lease_ref": lease_ref,
+                "checkpoint_ref": checkpoint_ref,
+                "checkpoint_sha256": f"sha256:{digest}",
+                "outcome": outcome,
+            }
+            ack_hash = _canonical_hash(ack)
+            row = self.connection.execute(
+                "SELECT status, processing_revision, lease_ref, lease_expires_at, "
+                "ack_hash, ack_json FROM xianyu_inquiry_processing "
+                "WHERE event_identity = ?",
+                (event_identity,),
+            ).fetchone()
+            if row is None:
+                raise NativeInquiryNotFound(event_identity)
+            status, revision, current_lease, expires_at, stored_ack_hash, ack_json = row
+            if status == "PROCESSED":
+                if current_lease != lease_ref or stored_ack_hash != ack_hash:
+                    raise NativeInquiryAckConflict(event_identity)
+                self.connection.commit()
+                return {
+                    "status": "PROCESSED",
+                    "processing_revision": revision,
+                    "ack_hash": ack_hash,
+                    "ack": json.loads(ack_json),
+                    "replayed": True,
+                }
+            paused = self.connection.execute(
+                "SELECT paused FROM xianyu_conversation_takeovers "
+                "WHERE account_ref = ? AND conversation_ref = ?",
+                (account_ref, conversation_ref),
+            ).fetchone()
+            if paused is not None and bool(paused[0]):
+                raise NativeInquiryLeaseConflict(event_identity)
+            if status != "PROCESSING" or current_lease != lease_ref or not expires_at:
+                raise NativeInquiryLeaseConflict(event_identity)
+            if _parse_utc(expires_at, "lease_expires_at") <= acknowledged_at:
+                raise NativeInquiryLeaseConflict(event_identity)
+
+            updated_at = acknowledged_at.isoformat().replace("+00:00", "Z")
+            serialized = json.dumps(ack, ensure_ascii=False, sort_keys=True)
+            self.connection.execute(
+                "UPDATE xianyu_inquiry_processing SET status = 'PROCESSED', "
+                "ack_hash = ?, ack_json = ?, updated_at = ? WHERE event_identity = ?",
+                (ack_hash, serialized, updated_at, event_identity),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return {
+            "status": "PROCESSED",
+            "processing_revision": revision,
+            "ack_hash": ack_hash,
+            "ack": ack,
+            "replayed": False,
         }
 
     def conversation_pause_state(
@@ -364,22 +761,28 @@ class OperationJournal:
 
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            row = self.connection.execute(
-                "SELECT paused, state_revision, updated_at "
-                "FROM xianyu_conversation_takeovers "
-                "WHERE account_ref = ? AND conversation_ref = ?",
-                (account_ref, conversation_ref),
-            ).fetchone()
-            if row is not None and bool(row[0]) is paused:
-                self.connection.commit()
-                return {
-                    "paused": paused,
-                    "state_revision": row[1],
-                    "updated_at": row[2],
-                    "replayed": True,
-                }
-            revision = 1 if row is None else row[1] + 1
-            updated_at = _utc_now()
+            result = self._set_pause_in_transaction(
+                account_ref, conversation_ref, paused
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return result
+
+    def _set_pause_in_transaction(
+        self, account_ref: str, conversation_ref: str, paused: bool
+    ) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT paused, state_revision, updated_at "
+            "FROM xianyu_conversation_takeovers "
+            "WHERE account_ref = ? AND conversation_ref = ?",
+            (account_ref, conversation_ref),
+        ).fetchone()
+        replayed = row is not None and bool(row[0]) is paused
+        revision = 1 if row is None else row[1] + (0 if replayed else 1)
+        updated_at = row[2] if replayed else _utc_now()
+        if not replayed:
             self.connection.execute(
                 "INSERT INTO xianyu_conversation_takeovers "
                 "(account_ref, conversation_ref, paused, state_revision, updated_at) "
@@ -390,51 +793,116 @@ class OperationJournal:
                 "updated_at = excluded.updated_at",
                 (account_ref, conversation_ref, int(paused), revision, updated_at),
             )
-            self.connection.commit()
-        except Exception:
-            self.connection.rollback()
-            raise
+        revoked_leases = 0
+        if paused:
+            cursor = self.connection.execute(
+                "UPDATE xianyu_inquiry_processing SET status = 'OBSERVED', "
+                "processing_revision = processing_revision + 1, "
+                "claimant_ref = NULL, lease_ref = NULL, lease_expires_at = NULL, "
+                "updated_at = ? WHERE account_ref = ? AND conversation_ref = ? "
+                "AND status = 'PROCESSING'",
+                (_utc_now(), account_ref, conversation_ref),
+            )
+            revoked_leases = cursor.rowcount
         return {
             "paused": paused,
             "state_revision": revision,
             "updated_at": updated_at,
-            "replayed": False,
+            "replayed": replayed,
+            "revoked_leases": revoked_leases,
         }
 
-    def toggle_conversation_paused(
-        self, account_ref: str, conversation_ref: str
+    def apply_conversation_pause_command(
+        self,
+        *,
+        account_ref: str,
+        conversation_ref: str,
+        message_ref: str,
+        message_revision: str,
+        desired_paused: bool,
     ) -> dict[str, Any]:
-        self._require_non_empty(account_ref, "account_ref")
-        self._require_non_empty(conversation_ref, "conversation_ref")
+        if not isinstance(desired_paused, bool):
+            raise TypeError("desired_paused must be a boolean")
+        for name, value in {
+            "account_ref": account_ref,
+            "conversation_ref": conversation_ref,
+            "message_ref": message_ref,
+            "message_revision": message_revision,
+        }.items():
+            self._require_non_empty(value, name)
+        command = {
+            "account_ref": account_ref,
+            "conversation_ref": conversation_ref,
+            "message_ref": message_ref,
+            "message_revision": message_revision,
+            "desired_paused": desired_paused,
+        }
+        command_identity = _stable_ref(
+            "takeover-command",
+            account_ref,
+            conversation_ref,
+            message_ref,
+            message_revision,
+        )
+        command_hash = _canonical_hash(command)
+
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            row = self.connection.execute(
-                "SELECT paused, state_revision FROM xianyu_conversation_takeovers "
-                "WHERE account_ref = ? AND conversation_ref = ?",
-                (account_ref, conversation_ref),
+            existing = self.connection.execute(
+                "SELECT command_hash, command_json FROM xianyu_takeover_commands "
+                "WHERE command_identity = ?",
+                (command_identity,),
             ).fetchone()
-            paused = True if row is None else not bool(row[0])
-            revision = 1 if row is None else row[1] + 1
-            updated_at = _utc_now()
+            if existing is not None:
+                if existing[0] != command_hash:
+                    raise TakeoverCommandIdentityConflict(command_identity)
+                state = self.conversation_pause_state(account_ref, conversation_ref)
+                self.connection.commit()
+                return {
+                    "command_identity": command_identity,
+                    "command_hash": command_hash,
+                    "desired_paused": desired_paused,
+                    **state,
+                    "command_replayed": True,
+                    "revoked_leases": 0,
+                }
+            conflicting = self.connection.execute(
+                "SELECT command_identity FROM xianyu_takeover_commands "
+                "WHERE account_ref = ? AND message_ref = ? LIMIT 1",
+                (account_ref, message_ref),
+            ).fetchone()
+            if conflicting is not None:
+                raise TakeoverCommandBindingConflict(conflicting[0])
             self.connection.execute(
-                "INSERT INTO xianyu_conversation_takeovers "
-                "(account_ref, conversation_ref, paused, state_revision, updated_at) "
-                "VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(account_ref, conversation_ref) DO UPDATE SET "
-                "paused = excluded.paused, "
-                "state_revision = excluded.state_revision, "
-                "updated_at = excluded.updated_at",
-                (account_ref, conversation_ref, int(paused), revision, updated_at),
+                "INSERT INTO xianyu_takeover_commands "
+                "(command_identity, command_hash, account_ref, conversation_ref, "
+                "message_ref, message_revision, desired_paused, command_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    command_identity,
+                    command_hash,
+                    account_ref,
+                    conversation_ref,
+                    message_ref,
+                    message_revision,
+                    int(desired_paused),
+                    json.dumps(command, ensure_ascii=False, sort_keys=True),
+                    _utc_now(),
+                ),
+            )
+            state = self._set_pause_in_transaction(
+                account_ref, conversation_ref, desired_paused
             )
             self.connection.commit()
         except Exception:
             self.connection.rollback()
             raise
         return {
-            "paused": paused,
-            "state_revision": revision,
-            "updated_at": updated_at,
-            "replayed": False,
+            "command_identity": command_identity,
+            "command_hash": command_hash,
+            "desired_paused": desired_paused,
+            **state,
+            "command_replayed": False,
         }
 
     def close(self) -> None:
@@ -447,6 +915,50 @@ class NativeInquiryIdentityConflict(RuntimeError):
             f"native inquiry identity is already bound to different content: {event_identity}"
         )
         self.event_identity = event_identity
+
+
+class NativeInquiryNotFound(RuntimeError):
+    def __init__(self, event_identity: str):
+        super().__init__(f"native inquiry was not observed: {event_identity}")
+        self.event_identity = event_identity
+
+
+class NativeInquiryBindingConflict(RuntimeError):
+    def __init__(self, event_identity: str):
+        super().__init__(
+            f"native inquiry reference is bound to a different account, "
+            f"conversation, or revision: {event_identity}"
+        )
+        self.event_identity = event_identity
+
+
+class NativeInquiryLeaseConflict(RuntimeError):
+    def __init__(self, event_identity: str):
+        super().__init__(f"native inquiry lease is missing, expired, or revoked: {event_identity}")
+        self.event_identity = event_identity
+
+
+class NativeInquiryAckConflict(RuntimeError):
+    def __init__(self, event_identity: str):
+        super().__init__(f"native inquiry ACK conflicts with the durable result: {event_identity}")
+        self.event_identity = event_identity
+
+
+class TakeoverCommandIdentityConflict(RuntimeError):
+    def __init__(self, command_identity: str):
+        super().__init__(
+            f"takeover command identity is already bound to different content: "
+            f"{command_identity}"
+        )
+        self.command_identity = command_identity
+
+
+class TakeoverCommandBindingConflict(RuntimeError):
+    def __init__(self, command_identity: str):
+        super().__init__(
+            f"takeover command is bound to a different conversation: {command_identity}"
+        )
+        self.command_identity = command_identity
 
 
 class SafeAdapter:
@@ -574,12 +1086,21 @@ class SafeAdapter:
             return self._result(request, "REJECTED", "INVALID_INQUIRY_TIMESTAMP")
         if observed.tzinfo is None:
             return self._result(request, "REJECTED", "INVALID_INQUIRY_TIMESTAMP")
-        native = self.journal.get_native_inquiry(
-            account_ref=request["account_ref"],
-            conversation_ref=payload["conversation_ref"],
-            message_ref=payload["message_ref"],
-            message_revision=payload["message_revision"],
-        )
+        try:
+            native = self.journal.get_native_inquiry(
+                account_ref=request["account_ref"],
+                conversation_ref=payload["conversation_ref"],
+                message_ref=payload["message_ref"],
+                message_revision=payload["message_revision"],
+            )
+        except NativeInquiryBindingConflict:
+            return self._result(
+                request,
+                "REJECTED",
+                "NATIVE_EVENT_BINDING_CONFLICT",
+                details={"message_revision": payload["message_revision"]},
+                retry_safe=False,
+            )
         identity = _stable_ref(
             "message",
             request["account_ref"],

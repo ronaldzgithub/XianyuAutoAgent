@@ -5,9 +5,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from xianyu_adapter import (
+    NativeInquiryAckConflict,
+    NativeInquiryBindingConflict,
     NativeInquiryIdentityConflict,
+    NativeInquiryLeaseConflict,
     OperationJournal,
     SafeAdapter,
+    TakeoverCommandBindingConflict,
+    TakeoverCommandIdentityConflict,
     descriptor,
 )
 
@@ -195,6 +200,22 @@ class SafeAdapterTest(unittest.TestCase):
         self.assertEqual(conflict["code"], "NATIVE_EVENT_IDENTITY_CONFLICT")
         self.assertFalse(conflict["retry_safe"])
 
+        with self.assertRaises(NativeInquiryBindingConflict):
+            self.journal.record_native_inquiry(
+                account_ref="owner-account-1",
+                **inquiry_payload(revision="stale-or-edited-revision"),
+            )
+        stale_read = SafeAdapter(self.journal).execute(
+            request(
+                "inquiry-stale-revision",
+                "inquiry.read",
+                inquiry_payload(revision="stale-or-edited-revision"),
+            )
+        )
+        self.assertEqual(stale_read["status"], "REJECTED")
+        self.assertEqual(stale_read["code"], "NATIVE_EVENT_BINDING_CONFLICT")
+        self.assertFalse(stale_read["retry_safe"])
+
     def test_manual_pause_persists_and_only_changes_on_explicit_transition(self):
         account_ref = "owner-account-1"
         conversation_ref = "conversation-native-7"
@@ -214,9 +235,7 @@ class SafeAdapterTest(unittest.TestCase):
             persisted = reopened.conversation_pause_state(
                 account_ref, conversation_ref
             )
-            resumed = reopened.set_conversation_paused(
-                account_ref, conversation_ref, False
-            )
+            resumed = reopened.set_conversation_paused(account_ref, conversation_ref, False)
         finally:
             reopened.close()
         self.journal = OperationJournal(self.database)
@@ -225,6 +244,261 @@ class SafeAdapterTest(unittest.TestCase):
         self.assertEqual(persisted["state_revision"], 1)
         self.assertFalse(resumed["paused"])
         self.assertEqual(resumed["state_revision"], 2)
+
+    def test_processing_lease_recovers_after_crash_and_ack_replay_is_idempotent(self):
+        payload = inquiry_payload()
+        self.journal.record_native_inquiry(account_ref="owner-account-1", **payload)
+        first = self.journal.claim_native_inquiry(
+            account_ref="owner-account-1",
+            conversation_ref=payload["conversation_ref"],
+            message_ref=payload["message_ref"],
+            message_revision=payload["message_revision"],
+            claimant_ref="listener-instance-1",
+            lease_seconds=10,
+            now="2026-09-12T12:00:00Z",
+        )
+        replay = self.journal.claim_native_inquiry(
+            account_ref="owner-account-1",
+            conversation_ref=payload["conversation_ref"],
+            message_ref=payload["message_ref"],
+            message_revision=payload["message_revision"],
+            claimant_ref="listener-instance-1",
+            lease_seconds=10,
+            now="2026-09-12T12:00:01Z",
+        )
+        self.assertTrue(first["claimed"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(first["lease_ref"], replay["lease_ref"])
+
+        self.journal.close()
+        reopened = OperationJournal(self.database)
+        try:
+            busy = reopened.claim_native_inquiry(
+                account_ref="owner-account-1",
+                conversation_ref=payload["conversation_ref"],
+                message_ref=payload["message_ref"],
+                message_revision=payload["message_revision"],
+                claimant_ref="listener-instance-2",
+                lease_seconds=10,
+                now="2026-09-12T12:00:05Z",
+            )
+            recovered = reopened.claim_native_inquiry(
+                account_ref="owner-account-1",
+                conversation_ref=payload["conversation_ref"],
+                message_ref=payload["message_ref"],
+                message_revision=payload["message_revision"],
+                claimant_ref="listener-instance-2",
+                lease_seconds=10,
+                now="2026-09-12T12:00:11Z",
+            )
+            self.assertTrue(busy["busy"])
+            self.assertFalse(busy["claimed"])
+            self.assertTrue(recovered["claimed"])
+            self.assertEqual(recovered["processing_revision"], 2)
+            self.assertNotEqual(first["lease_ref"], recovered["lease_ref"])
+
+            with self.assertRaises(NativeInquiryLeaseConflict):
+                reopened.ack_native_inquiry(
+                    account_ref="owner-account-1",
+                    conversation_ref=payload["conversation_ref"],
+                    message_ref=payload["message_ref"],
+                    message_revision=payload["message_revision"],
+                    lease_ref=first["lease_ref"],
+                    checkpoint_ref="checkpoint-1",
+                    checkpoint_sha256="a" * 64,
+                    outcome="DRAFT_READY",
+                    now="2026-09-12T12:00:12Z",
+                )
+            ack = reopened.ack_native_inquiry(
+                account_ref="owner-account-1",
+                conversation_ref=payload["conversation_ref"],
+                message_ref=payload["message_ref"],
+                message_revision=payload["message_revision"],
+                lease_ref=recovered["lease_ref"],
+                checkpoint_ref="checkpoint-1",
+                checkpoint_sha256="a" * 64,
+                outcome="DRAFT_READY",
+                now="2026-09-12T12:00:12Z",
+            )
+            replayed_ack = reopened.ack_native_inquiry(
+                account_ref="owner-account-1",
+                conversation_ref=payload["conversation_ref"],
+                message_ref=payload["message_ref"],
+                message_revision=payload["message_revision"],
+                lease_ref=recovered["lease_ref"],
+                checkpoint_ref="checkpoint-1",
+                checkpoint_sha256="a" * 64,
+                outcome="DRAFT_READY",
+                now="2026-09-12T12:00:30Z",
+            )
+            self.assertFalse(ack["replayed"])
+            self.assertTrue(replayed_ack["replayed"])
+            with self.assertRaises(NativeInquiryAckConflict):
+                reopened.ack_native_inquiry(
+                    account_ref="owner-account-1",
+                    conversation_ref=payload["conversation_ref"],
+                    message_ref=payload["message_ref"],
+                    message_revision=payload["message_revision"],
+                    lease_ref=recovered["lease_ref"],
+                    checkpoint_ref="checkpoint-changed",
+                    checkpoint_sha256="b" * 64,
+                    outcome="DRAFT_READY",
+                    now="2026-09-12T12:00:30Z",
+                )
+        finally:
+            reopened.close()
+        self.journal = OperationJournal(self.database)
+
+    def test_observation_commit_before_processing_is_restart_claimable(self):
+        payload = inquiry_payload()
+        self.journal.record_native_inquiry(account_ref="owner-account-1", **payload)
+        observed = self.journal.inquiry_processing_state(
+            account_ref="owner-account-1",
+            conversation_ref=payload["conversation_ref"],
+            message_ref=payload["message_ref"],
+            message_revision=payload["message_revision"],
+        )
+        self.assertEqual(observed["status"], "OBSERVED")
+        self.journal.close()
+
+        reopened = OperationJournal(self.database)
+        try:
+            claimed = reopened.claim_native_inquiry(
+                account_ref="owner-account-1",
+                conversation_ref=payload["conversation_ref"],
+                message_ref=payload["message_ref"],
+                message_revision=payload["message_revision"],
+                claimant_ref="listener-after-restart",
+                now="2026-09-12T12:00:01Z",
+            )
+        finally:
+            reopened.close()
+        self.journal = OperationJournal(self.database)
+        self.assertTrue(claimed["claimed"])
+        self.assertEqual(claimed["processing_revision"], 1)
+
+    def test_pause_revokes_lease_and_desired_state_commands_resume_safely(self):
+        payload = inquiry_payload()
+        self.journal.record_native_inquiry(account_ref="owner-account-1", **payload)
+        claimed = self.journal.claim_native_inquiry(
+            account_ref="owner-account-1",
+            conversation_ref=payload["conversation_ref"],
+            message_ref=payload["message_ref"],
+            message_revision=payload["message_revision"],
+            claimant_ref="listener-instance-1",
+            now="2026-09-12T12:00:00Z",
+        )
+        with self.assertRaises(NativeInquiryBindingConflict):
+            self.journal.claim_native_inquiry(
+                account_ref="wrong-account",
+                conversation_ref=payload["conversation_ref"],
+                message_ref=payload["message_ref"],
+                message_revision=payload["message_revision"],
+                claimant_ref="listener-instance-wrong",
+                now="2026-09-12T12:00:00Z",
+            )
+        with self.assertRaises(NativeInquiryBindingConflict):
+            self.journal.ack_native_inquiry(
+                account_ref="owner-account-1",
+                conversation_ref=payload["conversation_ref"],
+                message_ref=payload["message_ref"],
+                message_revision="old-revision",
+                lease_ref=claimed["lease_ref"],
+                checkpoint_ref="checkpoint-old-revision",
+                checkpoint_sha256="a" * 64,
+                outcome="DRAFT_READY",
+                now="2026-09-12T12:00:01Z",
+            )
+        pause = self.journal.apply_conversation_pause_command(
+            account_ref="owner-account-1",
+            conversation_ref=payload["conversation_ref"],
+            message_ref="control-message-1",
+            message_revision="control-revision-1",
+            desired_paused=True,
+        )
+        duplicate_pause = self.journal.apply_conversation_pause_command(
+            account_ref="owner-account-1",
+            conversation_ref=payload["conversation_ref"],
+            message_ref="control-message-1",
+            message_revision="control-revision-1",
+            desired_paused=True,
+        )
+        self.assertEqual(pause["revoked_leases"], 1)
+        self.assertTrue(duplicate_pause["command_replayed"])
+        self.assertEqual(pause["state_revision"], duplicate_pause["state_revision"])
+        revoked_state = self.journal.inquiry_processing_state(
+            account_ref="owner-account-1",
+            conversation_ref=payload["conversation_ref"],
+            message_ref=payload["message_ref"],
+            message_revision=payload["message_revision"],
+        )
+        self.assertEqual(revoked_state["status"], "OBSERVED")
+        self.assertIsNone(revoked_state["lease_ref"])
+        with self.assertRaises(NativeInquiryLeaseConflict):
+            self.journal.ack_native_inquiry(
+                account_ref="owner-account-1",
+                conversation_ref=payload["conversation_ref"],
+                message_ref=payload["message_ref"],
+                message_revision=payload["message_revision"],
+                lease_ref=claimed["lease_ref"],
+                checkpoint_ref="checkpoint-revoked",
+                checkpoint_sha256="a" * 64,
+                outcome="DRAFT_READY",
+                now="2026-09-12T12:00:01Z",
+            )
+        paused_claim = self.journal.claim_native_inquiry(
+            account_ref="owner-account-1",
+            conversation_ref=payload["conversation_ref"],
+            message_ref=payload["message_ref"],
+            message_revision=payload["message_revision"],
+            claimant_ref="listener-instance-2",
+            now="2026-09-12T12:00:02Z",
+        )
+        self.assertEqual(paused_claim["status"], "PAUSED")
+        self.assertFalse(paused_claim["claimed"])
+
+        with self.assertRaises(TakeoverCommandIdentityConflict):
+            self.journal.apply_conversation_pause_command(
+                account_ref="owner-account-1",
+                conversation_ref=payload["conversation_ref"],
+                message_ref="control-message-1",
+                message_revision="control-revision-1",
+                desired_paused=False,
+            )
+        with self.assertRaises(TakeoverCommandBindingConflict):
+            self.journal.apply_conversation_pause_command(
+                account_ref="owner-account-1",
+                conversation_ref="wrong-conversation",
+                message_ref="control-message-1",
+                message_revision="stale-revision",
+                desired_paused=True,
+            )
+        resume = self.journal.apply_conversation_pause_command(
+            account_ref="owner-account-1",
+            conversation_ref=payload["conversation_ref"],
+            message_ref="control-message-2",
+            message_revision="control-revision-2",
+            desired_paused=False,
+        )
+        resumed_claim = self.journal.claim_native_inquiry(
+            account_ref="owner-account-1",
+            conversation_ref=payload["conversation_ref"],
+            message_ref=payload["message_ref"],
+            message_revision=payload["message_revision"],
+            claimant_ref="listener-instance-2",
+            now="2026-09-12T12:00:03Z",
+        )
+        self.assertFalse(resume["paused"])
+        self.assertTrue(resumed_claim["claimed"])
+        with self.assertRaises(NativeInquiryBindingConflict):
+            self.journal.claim_native_inquiry(
+                account_ref="owner-account-1",
+                conversation_ref="wrong-conversation",
+                message_ref=payload["message_ref"],
+                message_revision=payload["message_revision"],
+                claimant_ref="listener-instance-3",
+                now="2026-09-12T12:00:04Z",
+            )
 
     def test_quote_constraint_requires_seven_costs_supply_and_terms(self):
         payload = {
